@@ -759,6 +759,17 @@ async function resolveOpenContextAccess(
   return { role: 'editor', tokenId: null, ownerAuthorized: false };
 }
 
+function getRequestedCollabActor(req: Request): string | null {
+  const raw = req.header('x-collab-actor');
+  if (!raw) return null;
+  const actor = raw.trim();
+  if (!actor) return null;
+  if (actor.startsWith('user:') || actor.startsWith('human:') || actor.startsWith('ai:')) {
+    return actor;
+  }
+  return null;
+}
+
 function deriveShareCapabilities(role: ShareRole, shareState: string): {
   canRead: boolean;
   canComment: boolean;
@@ -1922,6 +1933,7 @@ apiRoutes.get('/documents/:slug/open-context', async (req: Request, res: Respons
   const session = buildCollabSession(slug, role, {
     tokenId: access.tokenId,
     wsUrlBase: resolveRequestScopedCollabWsBase(req),
+    actor: getRequestedCollabActor(req),
   });
   if (!session) {
     res.status(500).json({ error: 'Unable to build collab session' });
@@ -1993,6 +2005,7 @@ apiRoutes.post('/documents/:slug/collab-refresh', async (req: Request, res: Resp
   const session = buildCollabSession(slug, role, {
     tokenId: access.tokenId,
     wsUrlBase: resolveRequestScopedCollabWsBase(req),
+    actor: getRequestedCollabActor(req),
   });
   if (!session) {
     res.status(500).json({ error: 'Unable to build collab session' });
@@ -2065,6 +2078,7 @@ apiRoutes.get('/documents/:slug/collab-session', (req: Request, res: Response) =
   const session = buildCollabSession(slug, role, {
     tokenId: access?.tokenId ?? null,
     wsUrlBase: resolveRequestScopedCollabWsBase(req),
+    actor: getRequestedCollabActor(req),
   });
   if (!session) {
     res.status(500).json({ error: 'Unable to build collab session' });
