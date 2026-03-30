@@ -21,8 +21,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = Number.parseInt(process.env.PORT || '4000', 10);
 const DEFAULT_ALLOWED_CORS_ORIGINS = [
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
+  'http://localhost:3142',
+  'http://127.0.0.1:3142',
   'http://localhost:4000',
   'http://127.0.0.1:4000',
   'null',
