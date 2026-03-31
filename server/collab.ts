@@ -4119,8 +4119,12 @@ async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string 
   }
   try {
     const parser = await getHeadlessMilkdownParser();
+    const sourceFragment = doc.getXmlFragment('prosemirror');
+    const projectionSource = hasTiptapNodeNameInProjectionTree(sourceFragment)
+      ? getMilkdownCompatibleProjectionFragment(sourceFragment)
+      : sourceFragment;
     const root = yXmlFragmentToProseMirrorRootNode(
-      doc.getXmlFragment('prosemirror') as any,
+      projectionSource as any,
       parser.schema as any,
     ) as ProseMirrorNode;
     return await serializeMarkdown(root);
@@ -4130,6 +4134,49 @@ async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string 
     });
     return null;
   }
+}
+
+const TIPTAP_TO_MILKDOWN_NODE_NAME: Readonly<Record<string, string>> = {
+  orderedList: 'ordered_list',
+  bulletList: 'bullet_list',
+  listItem: 'list_item',
+  taskList: 'bullet_list',
+  taskItem: 'list_item',
+};
+
+type ProjectionXmlNode = Y.XmlElement | Y.XmlText;
+
+function hasTiptapNodeNameInProjectionTree(node: Y.XmlFragment | ProjectionXmlNode): boolean {
+  if (node instanceof Y.XmlText) return false;
+  if (node instanceof Y.XmlElement && TIPTAP_TO_MILKDOWN_NODE_NAME[node.nodeName]) return true;
+  return (node.toArray() as ProjectionXmlNode[]).some((child) => hasTiptapNodeNameInProjectionTree(child));
+}
+
+function normalizeProjectionXmlNode(node: ProjectionXmlNode): ProjectionXmlNode {
+  if (node instanceof Y.XmlText) {
+    return node.clone();
+  }
+
+  const mappedNodeName = TIPTAP_TO_MILKDOWN_NODE_NAME[node.nodeName] ?? node.nodeName;
+  const normalizedNode = new Y.XmlElement(mappedNodeName);
+  for (const [key, value] of Object.entries(node.getAttributes())) {
+    normalizedNode.setAttribute(key, value as any);
+  }
+  normalizedNode.insert(
+    0,
+    (node.toArray() as ProjectionXmlNode[]).map((child) => normalizeProjectionXmlNode(child)),
+  );
+  return normalizedNode;
+}
+
+function getMilkdownCompatibleProjectionFragment(sourceFragment: Y.XmlFragment): Y.XmlFragment {
+  const projectionDoc = new Y.Doc();
+  const projectionFragment = projectionDoc.getXmlFragment('prosemirror');
+  projectionFragment.insert(
+    0,
+    (sourceFragment.toArray() as ProjectionXmlNode[]).map((child) => normalizeProjectionXmlNode(child)),
+  );
+  return projectionFragment;
 }
 
 let canonicalSyncPostApplyFailureForTests: string | null = null;
