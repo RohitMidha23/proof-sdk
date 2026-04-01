@@ -124,6 +124,7 @@ async function buildSnapshotPayload(
     const payload: Record<string, unknown> = {
       ref: `b${index + 1}`,
       id: stableBlockId,
+      blockId: stableBlockId,
       type: block.nodeType,
       markdown: stripAllProofSpanTags(block.markdown),
     };

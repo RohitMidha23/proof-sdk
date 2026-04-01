@@ -4,6 +4,7 @@ import * as Y from 'yjs';
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from 'y-prosemirror';
 import { type Node as ProseMirrorNode, type Schema } from '@milkdown/prose/model';
 import {
+  addDocumentEvent,
   appendYUpdate,
   bumpGlobalCollabAdmissionEpoch,
   bumpDocumentAccessEpoch,
@@ -28,6 +29,7 @@ import {
   getYUpdatesAtOrAfter,
   getYUpdatesAfter,
   listDocsWithStaleProjection,
+  listLiveDocumentBlocks,
   listSuspiciousProjectionCandidates,
   noteDocumentLiveCollabLease,
   replaceDocumentProjection,
@@ -37,6 +39,7 @@ import {
   upsertActiveCollabConnection,
   upsertPersistedGlobalCollabAdmissionGuard,
   updateDocument,
+  type DocumentBlockRow,
   type DocumentProjectionRow,
   type DocumentRow,
   type ProjectedDocumentRow,
@@ -1323,6 +1326,16 @@ function parseBooleanFlag(value: string | undefined, fallback: boolean): boolean
   return fallback;
 }
 
+function normalizeCollabActor(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const actor = value.trim();
+  if (!actor) return null;
+  if (actor.startsWith('user:') || actor.startsWith('human:') || actor.startsWith('ai:')) {
+    return actor;
+  }
+  return null;
+}
+
 function normalizeIsoTimestamp(value: unknown, fallbackIso: string): string {
   if (typeof value !== 'string') return fallbackIso;
   const trimmed = value.trim();
@@ -1545,6 +1558,12 @@ function getContextAccessEpoch(context: unknown): number | null {
   const raw = (context as { accessEpoch?: unknown }).accessEpoch;
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return null;
   return raw;
+}
+
+function getContextActor(context: unknown): string {
+  if (!context || typeof context !== 'object' || Array.isArray(context)) return 'collab';
+  const raw = (context as { actor?: unknown }).actor;
+  return normalizeCollabActor(typeof raw === 'string' ? raw : null) ?? 'collab';
 }
 
 function shouldDropStaleContextWrite(
@@ -1961,6 +1980,7 @@ type CollabSessionClaims = {
   accessEpoch: number;
   tokenId: string | null;
   jti: string;
+  actor: string | null;
 };
 
 function signCollabClaims(claims: CollabSessionClaims): string {
@@ -1996,15 +2016,25 @@ function verifyCollabToken(token: string): CollabSessionClaims | null {
   const accessEpoch = (claims as { accessEpoch?: unknown }).accessEpoch;
   const tokenId = (claims as { tokenId?: unknown }).tokenId;
   const jti = (claims as { jti?: unknown }).jti;
+  const actor = (claims as { actor?: unknown }).actor;
   if (typeof slug !== 'string' || slug.length === 0) return null;
   if (!isShareRole(role)) return null;
   if (typeof exp !== 'number' || !Number.isFinite(exp)) return null;
   if (typeof accessEpoch !== 'number' || !Number.isFinite(accessEpoch) || accessEpoch < 0) return null;
   if (tokenId !== null && typeof tokenId !== 'string') return null;
   if (typeof jti !== 'string' || jti.length < 6) return null;
+  if (actor !== undefined && actor !== null && typeof actor !== 'string') return null;
   if (Date.now() >= exp * 1000) return null;
 
-  return { slug, role, exp, accessEpoch, tokenId, jti };
+  return {
+    slug,
+    role,
+    exp,
+    accessEpoch,
+    tokenId,
+    jti,
+    actor: typeof actor === 'string' ? actor : null,
+  };
 }
 
 export function isValidCollabSessionToken(token: string): boolean {
@@ -4089,8 +4119,12 @@ async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string 
   }
   try {
     const parser = await getHeadlessMilkdownParser();
+    const sourceFragment = doc.getXmlFragment('prosemirror');
+    const projectionSource = hasTiptapNodeNameInProjectionTree(sourceFragment)
+      ? getMilkdownCompatibleProjectionFragment(sourceFragment)
+      : sourceFragment;
     const root = yXmlFragmentToProseMirrorRootNode(
-      doc.getXmlFragment('prosemirror') as any,
+      projectionSource as any,
       parser.schema as any,
     ) as ProseMirrorNode;
     return await serializeMarkdown(root);
@@ -4100,6 +4134,49 @@ async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string 
     });
     return null;
   }
+}
+
+const TIPTAP_TO_MILKDOWN_NODE_NAME: Readonly<Record<string, string>> = {
+  orderedList: 'ordered_list',
+  bulletList: 'bullet_list',
+  listItem: 'list_item',
+  taskList: 'bullet_list',
+  taskItem: 'list_item',
+};
+
+type ProjectionXmlNode = Y.XmlElement | Y.XmlText;
+
+function hasTiptapNodeNameInProjectionTree(node: Y.XmlFragment | ProjectionXmlNode): boolean {
+  if (node instanceof Y.XmlText) return false;
+  if (node instanceof Y.XmlElement && TIPTAP_TO_MILKDOWN_NODE_NAME[node.nodeName]) return true;
+  return (node.toArray() as ProjectionXmlNode[]).some((child) => hasTiptapNodeNameInProjectionTree(child));
+}
+
+function normalizeProjectionXmlNode(node: ProjectionXmlNode): ProjectionXmlNode {
+  if (node instanceof Y.XmlText) {
+    return node.clone();
+  }
+
+  const mappedNodeName = TIPTAP_TO_MILKDOWN_NODE_NAME[node.nodeName] ?? node.nodeName;
+  const normalizedNode = new Y.XmlElement(mappedNodeName);
+  for (const [key, value] of Object.entries(node.getAttributes())) {
+    normalizedNode.setAttribute(key, value as any);
+  }
+  normalizedNode.insert(
+    0,
+    (node.toArray() as ProjectionXmlNode[]).map((child) => normalizeProjectionXmlNode(child)),
+  );
+  return normalizedNode;
+}
+
+function getMilkdownCompatibleProjectionFragment(sourceFragment: Y.XmlFragment): Y.XmlFragment {
+  const projectionDoc = new Y.Doc();
+  const projectionFragment = projectionDoc.getXmlFragment('prosemirror');
+  projectionFragment.insert(
+    0,
+    (sourceFragment.toArray() as ProjectionXmlNode[]).map((child) => normalizeProjectionXmlNode(child)),
+  );
+  return projectionFragment;
 }
 
 let canonicalSyncPostApplyFailureForTests: string | null = null;
@@ -6748,6 +6825,43 @@ async function hydrateDocFromDbAsync(
   return ydoc;
 }
 
+function getProvenanceEventActor(sourceActor: string): string | null {
+  const normalized = normalizeCollabActor(sourceActor);
+  if (!normalized) return null;
+  if (normalized === 'human:collaborator') return null;
+  return normalized;
+}
+
+function isCollabWriteSource(sourceActor: string): boolean {
+  return sourceActor === 'collab' || normalizeCollabActor(sourceActor) !== null;
+}
+
+function getChangedBlockIds(
+  beforeBlocks: DocumentBlockRow[],
+  afterBlocks: DocumentBlockRow[],
+): string[] {
+  const beforeById = new Map<string, DocumentBlockRow>();
+  for (const block of beforeBlocks) {
+    beforeById.set(block.block_id, block);
+  }
+  const changed = new Set<string>();
+  for (const next of afterBlocks) {
+    const prev = beforeById.get(next.block_id);
+    if (!prev) {
+      changed.add(next.block_id);
+      continue;
+    }
+    if (
+      prev.markdown_hash !== next.markdown_hash
+      || prev.ordinal !== next.ordinal
+      || prev.node_type !== next.node_type
+    ) {
+      changed.add(next.block_id);
+    }
+  }
+  return Array.from(changed);
+}
+
 async function persistDoc(
   slug: string,
   ydoc: Y.Doc,
@@ -6789,7 +6903,7 @@ async function persistDoc(
     });
     return;
   }
-  if (sourceActor === 'collab') {
+  if (isCollabWriteSource(sourceActor)) {
     const docGeneration = docPersistGenerations.get(ydoc);
     if (typeof docGeneration === 'number' && docGeneration !== currentGeneration) {
       persistPending.delete(slug);
@@ -6826,7 +6940,7 @@ async function persistDoc(
       return;
     }
   }
-  if (sourceActor === 'collab') {
+  if (isCollabWriteSource(sourceActor)) {
     if (isCollabQuarantined(slug)) {
       persistPending.delete(slug);
       invalidateLoadedCollabDocument(slug);
@@ -6902,6 +7016,7 @@ async function persistDoc(
   const generation = currentGeneration;
   persistInFlight.set(slug, true);
   const startedAt = Date.now();
+  let collabEditedEvent: { actor: string; affectedBlockIds: string[] } | null = null;
   try {
     if ((persistGeneration.get(slug) ?? 0) !== generation || collabInvalidations.has(slug)) {
       return;
@@ -6929,7 +7044,7 @@ async function persistDoc(
     );
     const priorUpdateCount = updatesSinceCompaction.get(slug) ?? 0;
     let nextUpdateCount = priorUpdateCount;
-    const shouldMaterializeProjection = sourceActor === 'collab' && !isCollabQuarantined(slug);
+    const shouldMaterializeProjection = isCollabWriteSource(sourceActor) && !isCollabQuarantined(slug);
     let shouldBumpRevision = shouldMaterializeProjection;
     let skipPersistedStateWrite = false;
     const db = getDb();
@@ -6943,7 +7058,7 @@ async function persistDoc(
       let shouldWriteProjection = true;
       if (isCollabQuarantined(slug)) {
         shouldWriteProjection = false;
-        skipPersistedStateWrite = sourceActor === 'collab';
+        skipPersistedStateWrite = isCollabWriteSource(sourceActor);
         if (getCollabQuarantineGateStatus(slug).active) {
           setDocumentProjectionHealth(slug, 'quarantined');
         }
@@ -7152,6 +7267,9 @@ async function persistDoc(
         }
       }
       if (shouldWriteProjection) {
+        const eventActor = getProvenanceEventActor(sourceActor);
+        const currentRow = getDocumentBySlug(slug);
+        const blocksBeforeWrite = currentRow?.doc_id ? listLiveDocumentBlocks(currentRow.doc_id) : [];
         clearAllSlugPathologyCooldowns(slug);
         materializeProjection(slug, ydoc, {
           bumpRevision: shouldBumpRevision,
@@ -7159,6 +7277,13 @@ async function persistDoc(
           markdownOverride: projectionMarkdownOverride ?? undefined,
           source: 'persist',
         });
+        if (eventActor && currentRow?.doc_id) {
+          const blocksAfterWrite = listLiveDocumentBlocks(currentRow.doc_id);
+          const changedBlockIds = getChangedBlockIds(blocksBeforeWrite, blocksAfterWrite);
+          if (changedBlockIds.length > 0) {
+            collabEditedEvent = { actor: eventActor, affectedBlockIds: changedBlockIds };
+          }
+        }
       } else if (!skipPersistedStateWrite && deltaUpdate.byteLength > 0) {
         // Still advance y_state_version even when skipping projection writes
         // to prevent repeated stale-projection detection on startup.
@@ -7175,6 +7300,18 @@ async function persistDoc(
     }
     if (queuedRepairReason) {
       queueProjectionRepair(slug, queuedRepairReason);
+    }
+    if (collabEditedEvent) {
+      addDocumentEvent(
+        slug,
+        'document.collab.edited',
+        {
+          by: collabEditedEvent.actor,
+          source: 'collab',
+          affectedBlockIds: collabEditedEvent.affectedBlockIds,
+        },
+        collabEditedEvent.actor,
+      );
     }
     const authoritativeBaseline = {
       snapshot: authoritativeSnapshot,
@@ -7221,7 +7358,7 @@ async function persistDoc(
   }
 }
 
-function schedulePersistDoc(slug: string, ydoc: Y.Doc): void {
+function schedulePersistDoc(slug: string, ydoc: Y.Doc, sourceActor: string = 'collab'): void {
   const debounceMs = parsePositiveInt(process.env.COLLAB_PERSIST_DEBOUNCE_MS, DEFAULT_COLLAB_PERSIST_DEBOUNCE_MS);
   const expectedGeneration = getPersistGeneration(slug);
   if (!docPersistGenerations.has(ydoc)) {
@@ -7233,7 +7370,7 @@ function schedulePersistDoc(slug: string, ydoc: Y.Doc): void {
   }
   const timer = setTimeout(() => {
     persistTimers.delete(slug);
-    void persistDoc(slug, ydoc, 'collab', expectedGeneration);
+    void persistDoc(slug, ydoc, sourceActor, expectedGeneration);
   }, debounceMs);
   persistTimers.set(slug, timer);
 }
@@ -7891,7 +8028,7 @@ function resolveOnStoreConflict(slug: string, inMemoryDoc: Y.Doc): StoreConflict
   };
 }
 
-async function persistOnStoreDocument(slug: string, inMemoryDoc: Y.Doc): Promise<void> {
+async function persistOnStoreDocument(slug: string, inMemoryDoc: Y.Doc, sourceActor: string = 'collab'): Promise<void> {
   if (isCollabPersistenceReadOnly()) {
     if (!warnedReadOnlyPersistSlugs.has(slug)) {
       warnedReadOnlyPersistSlugs.add(slug);
@@ -7990,7 +8127,7 @@ async function persistOnStoreDocument(slug: string, inMemoryDoc: Y.Doc): Promise
     scheduleStaleOnStoreReload(slug);
     return;
   }
-  await persistDoc(slug, inMemoryDoc);
+  await persistDoc(slug, inMemoryDoc, sourceActor);
 }
 
 function applyYTextDiff(target: Y.Text, nextValue: string): void {
@@ -9917,6 +10054,7 @@ export function buildCollabSession(
   options?: {
     tokenId?: string | null;
     wsUrlBase?: string | null;
+    actor?: string | null;
   },
 ): CollabSessionInfo | null {
   const startedAtMs = Date.now();
@@ -9973,11 +10111,13 @@ export function buildCollabSession(
   const expiresAtEpoch = Math.floor(Date.now() / 1000) + ttlSeconds;
   noteRecentCollabSessionLease(slug, doc.access_epoch, ttlSeconds * 1000);
   noteDocumentLiveCollabLease(slug, doc.access_epoch);
+  const actor = normalizeCollabActor(options?.actor ?? null);
   console.log('[collab] buildCollabSession lease noted', {
     slug,
     role,
     accessEpoch: doc.access_epoch,
     tokenId: options?.tokenId ?? null,
+    actor,
     ttlSeconds,
   });
   const token = signCollabClaims({
@@ -9987,6 +10127,7 @@ export function buildCollabSession(
     accessEpoch: doc.access_epoch,
     tokenId: options?.tokenId ?? null,
     jti: randomUUID(),
+    actor,
   });
   const snapshot = getLatestYSnapshot(slug);
   const persistedStateVersion = Math.max(
@@ -10207,7 +10348,7 @@ export async function startCollabRuntime(mainHttpPort: number): Promise<CollabRu
         rememberLoadedDoc(data.documentName, data.document);
         markDocChanged(data.documentName);
         const canonicalDoc = loadedDocs.get(data.documentName) ?? data.document;
-        await persistOnStoreDocument(data.documentName, canonicalDoc);
+        await persistOnStoreDocument(data.documentName, canonicalDoc, getContextActor(data.context));
       },
       async onChange(data: { documentName: string; document: Y.Doc; context?: unknown }) {
         if (getContextAccessEpoch(data.context) === null) {
@@ -10229,7 +10370,7 @@ export async function startCollabRuntime(mainHttpPort: number): Promise<CollabRu
         }
         rememberLoadedDoc(data.documentName, data.document);
         markDocChanged(data.documentName);
-        schedulePersistDoc(data.documentName, data.document);
+        schedulePersistDoc(data.documentName, data.document, getContextActor(data.context));
       },
       async onDisconnect(data: { context?: unknown }) {
         detachAuthenticatedCollabPresence(data.context);
@@ -10380,7 +10521,7 @@ export async function startCollabRuntimeEmbedded(mainHttpPort: number): Promise<
         rememberLoadedDoc(data.documentName, data.document);
         markDocChanged(data.documentName);
         const canonicalDoc = loadedDocs.get(data.documentName) ?? data.document;
-        await persistOnStoreDocument(data.documentName, canonicalDoc);
+        await persistOnStoreDocument(data.documentName, canonicalDoc, getContextActor(data.context));
       },
       async onChange(data: { documentName: string; document: Y.Doc; context?: unknown }) {
         if (getContextAccessEpoch(data.context) === null) {
@@ -10399,7 +10540,7 @@ export async function startCollabRuntimeEmbedded(mainHttpPort: number): Promise<
         }
         rememberLoadedDoc(data.documentName, data.document);
         markDocChanged(data.documentName);
-        schedulePersistDoc(data.documentName, data.document);
+        schedulePersistDoc(data.documentName, data.document, getContextActor(data.context));
       },
       async onDisconnect(data: { context?: unknown }) {
         detachAuthenticatedCollabPresence(data.context);
@@ -10568,7 +10709,7 @@ export async function startCollabRuntimeAttached(mainHttpServer: HttpServer, mai
         rememberLoadedDoc(data.documentName, data.document);
         markDocChanged(data.documentName);
         const canonicalDoc = loadedDocs.get(data.documentName) ?? data.document;
-        await persistOnStoreDocument(data.documentName, canonicalDoc);
+        await persistOnStoreDocument(data.documentName, canonicalDoc, getContextActor(data.context));
       },
       async onChange(data: { documentName: string; document: Y.Doc; context?: unknown }) {
         if (getContextAccessEpoch(data.context) === null) {
@@ -10587,7 +10728,7 @@ export async function startCollabRuntimeAttached(mainHttpServer: HttpServer, mai
         }
         rememberLoadedDoc(data.documentName, data.document);
         markDocChanged(data.documentName);
-        schedulePersistDoc(data.documentName, data.document);
+        schedulePersistDoc(data.documentName, data.document, getContextActor(data.context));
       },
     } as unknown);
 

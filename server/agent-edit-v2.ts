@@ -382,7 +382,12 @@ async function applyOperations(
   blocks: BlockState[],
   operations: AgentEditV2Operation[],
   nextRevision: number,
-): Promise<{ ok: true; blocks: BlockState[] } | { ok: false; code: string; message: string; opIndex: number } > {
+): Promise<
+  | { ok: true; blocks: BlockState[]; affectedBlockIds: string[] }
+  | { ok: false; code: string; message: string; opIndex: number }
+> {
+  const affectedBlockIds = new Set<string>();
+
   for (let opIndex = 0; opIndex < operations.length; opIndex += 1) {
     const op = operations[opIndex];
     if (op.op === 'replace_block') {
@@ -394,7 +399,9 @@ async function applyOperations(
       if ('error' in parsed) {
         return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
       }
-      blocks.splice(idx, 1, { id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
+      const nextBlock = { id: randomUUID(), createdRevision: nextRevision, node: parsed.node };
+      blocks.splice(idx, 1, nextBlock);
+      affectedBlockIds.add(nextBlock.id);
       continue;
     }
 
@@ -409,7 +416,9 @@ async function applyOperations(
         if ('error' in parsed) {
           return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
         }
-        inserts.push({ id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
+        const nextBlock = { id: randomUUID(), createdRevision: nextRevision, node: parsed.node };
+        inserts.push(nextBlock);
+        affectedBlockIds.add(nextBlock.id);
       }
       blocks.splice(idx + 1, 0, ...inserts);
       continue;
@@ -426,7 +435,9 @@ async function applyOperations(
         if ('error' in parsed) {
           return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
         }
-        inserts.push({ id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
+        const nextBlock = { id: randomUUID(), createdRevision: nextRevision, node: parsed.node };
+        inserts.push(nextBlock);
+        affectedBlockIds.add(nextBlock.id);
       }
       blocks.splice(idx, 0, ...inserts);
       continue;
@@ -489,11 +500,12 @@ async function applyOperations(
         return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
       }
       blocks.splice(idx, 1, { ...current, node: parsed.node });
+      affectedBlockIds.add(current.id);
       continue;
     }
   }
 
-  return { ok: true, blocks };
+  return { ok: true, blocks, affectedBlockIds: Array.from(affectedBlockIds) };
 }
 
 function parseCanonicalMarks(raw: string): Record<string, unknown> {
@@ -1056,10 +1068,13 @@ export async function applyAgentEditV2(
       };
     }
 
+    const affectedBlockIds = usingAuthoritativeFallback
+      ? []
+      : applied.affectedBlockIds;
     addDocumentEvent(
       slug,
       'agent.edit.v2',
-      { by, operations: normalized.operations },
+      { by, operations: normalized.operations, affectedBlockIds },
       by,
       options?.idempotencyKey,
       options?.idempotencyRoute,
@@ -1127,10 +1142,13 @@ export async function applyAgentEditV2(
     };
   }
 
+  const affectedBlockIds = usingAuthoritativeFallback
+    ? []
+    : applied.affectedBlockIds;
   addDocumentEvent(
     slug,
     'agent.edit.v2',
-    { by, operations: normalized.operations },
+    { by, operations: normalized.operations, affectedBlockIds },
     by,
     options?.idempotencyKey,
     options?.idempotencyRoute,
